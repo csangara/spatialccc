@@ -1,0 +1,441 @@
+---
+title: "liver_cosmx_analysis"
+output: html_document
+date: '2023-05-26'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(nichenetr)
+library(Giotto)
+```
+
+```{r}
+liver_seurat_obj <- readRDS("LiverData/LiverData_RawNorm_CancerousLiver_Q2.rds")
+#liver_giotto_obj <- readRDS("LiverData/LiverData_RawNorm_NormalLiver_Q1_giotto.rds")
+ligand_target_matrix <- readRDS("ligand_target_matrix_nsga2r_final.rds")
+lr_network <- readRDS("lr_network_human_21122021.rds")
+#cell_proximities <- readRDS("cell_proximities_NormalLiver_Q1.rds")
+```
+
+```{r}
+# Check some dataset properties
+ggplot(data.frame(count = liver_seurat_obj$nCount_RNA), aes(x=count)) + geom_density() + theme_classic()
+ggplot(data.frame(count = liver_seurat_obj$nFeature_RNA), aes(x=count)) + geom_density() + theme_classic()
+
+```
+
+
+```{r}
+# NicheNet
+Idents(liver_seurat_obj)<-liver_seurat_obj$cellType
+receiver <- "tumor_2"
+expressed_genes_receiver <- get_expressed_genes(receiver, liver_seurat_obj, pct = 0.10)
+background_expressed_genes <- expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+
+geneset_oi <- FindMarkers(liver_seurat_obj, ident.1 = "tumor_2", ident.2 = "tumor_1", slot = "counts")
+geneset_oi <- geneset_oi %>% data.frame %>% filter(p_val_adj <= 0.05) %>% rownames %>% .[. %in% rownames(ligand_target_matrix)]
+
+possible_sender_celltypes <- liver_seurat_obj$cellType %>% unique %>% .[!grepl("tumor|NotDet", .)]
+
+all_ligand_activities <- lapply(possible_sender_celltypes, function(sender_celltype) {
+  print(sender_celltype)
+  expressed_genes_sender <- get_expressed_genes(sender_celltype, liver_seurat_obj, 0.10)
+
+  ligands <- lr_network %>% pull(from) %>% unique()
+  receptors <- lr_network %>% pull(to) %>% unique()
+
+  expressed_ligands <- intersect(ligands,expressed_genes_sender)
+  expressed_receptors <- intersect(receptors,expressed_genes_receiver)
+
+  potential_ligands <- lr_network %>% filter(from %in% expressed_ligands & to %in% expressed_receptors) %>% pull(from) %>% unique()
+
+  ligand_activities <- predict_ligand_activities(geneset = geneset_oi, background_expressed_genes = background_expressed_genes,
+                                                 ligand_target_matrix = ligand_target_matrix, potential_ligands = potential_ligands)
+
+  ligand_activities <- ligand_activities %>% arrange(-aupr) %>% mutate(rank = rank(desc(aupr)))
+  ligand_activities
+
+})
+
+summarized_ligand_activities <- all_ligand_activities %>% do.call(rbind, .) %>% group_by(test_ligand) %>% mutate(avg_rank = median(rank)) %>% arrange(avg_rank) %>% distinct(test_ligand, auroc, aupr, aupr_corrected, pearson, avg_rank) %>% ungroup()
+```
+
+```{r fig.height = 6, fig.width = 8}
+best_upstream_ligands = summarized_ligand_activities %>% top_n(20, aupr) %>% arrange(-aupr) %>% pull(test_ligand) %>% unique()
+DotPlot(liver_seurat_obj, features = best_upstream_ligands %>% rev(), cols = "RdYlBu") + RotatedAxis()
+
+active_ligand_target_links_df = best_upstream_ligands %>% lapply(get_weighted_ligand_target_links,geneset = geneset_oi, ligand_target_matrix = ligand_target_matrix, n = 200) %>% bind_rows() %>% drop_na()
+
+active_ligand_target_links = prepare_ligand_target_visualization(ligand_target_df = active_ligand_target_links_df, ligand_target_matrix = ligand_target_matrix, cutoff = 0.33)
+
+order_ligands = intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev() %>% make.names()
+order_targets = active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links)) %>% make.names()
+rownames(active_ligand_target_links) = rownames(active_ligand_target_links) %>% make.names() # make.names() for heatmap visualization of genes like H2-T23
+colnames(active_ligand_target_links) = colnames(active_ligand_target_links) %>% make.names() # make.names() for heatmap visualization of genes like H2-T23
+
+vis_ligand_target = active_ligand_target_links[order_targets,order_ligands] %>% t()
+
+p_ligand_target_network = vis_ligand_target %>% make_heatmap_ggplot("Prioritized ligands","Predicted target genes", color = "purple",legend_position = "top", x_axis_position = "top",legend_title = "Regulatory potential")  + theme(axis.text.x = element_text(face = "italic")) + scale_fill_gradient2(low = "whitesmoke",  high = "purple", breaks = c(0,0.0045,0.0090))
+p_ligand_target_network
+```
+
+```{r}
+ct_oi <- "tumor_2"
+ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=1) %>% pull(test_ligand) # TGFB3
+
+# Make knn matrix
+k <- 5
+knn_matrix <- dbscan::kNN(liver_seurat_obj@meta.data %>% select(x_slide_mm, y_slide_mm) %>% as.matrix, k=k)
+knn_df <- data.frame(from = rep(1:nrow(knn_matrix$id), k),
+                          to = as.vector(knn_matrix$id),
+                          weight = 1/(1 + as.vector(knn_matrix$dist)),
+                          distance = as.vector(knn_matrix$dist)) %>%
+              mutate(from_cellID = cell_ID_vec[from], to_cellID = cell_ID_vec[to]) %>%
+              mutate(from_cellType = liver_seurat_obj@meta.data[.$from_cellID, "cellType"],
+                       to_cellType = liver_seurat_obj@meta.data[.$to_cellID, "cellType"])
+  
+
+# How many of the neighbors express this?
+q_cutoff <- 0.9
+ligand_expr_df <- knn_df %>% filter(from_cellType == "tumor_2") %>%
+    rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from_cellID, neighbor_id = to_cellID)%>%
+  mutate(ligand_expr = t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))[.$neighbor_id,],
+                              is_ligand_expr = ligand_expr > quantile(liver_seurat_obj[ligand_oi,]@assays$RNA@data, q_cutoff)) %>%
+  group_by(cell_id, neighbour_cellType) %>% summarise(pct_ligand_expressed = sum(is_ligand_expr)/n(),
+                                                      max_ligand_expr = max(ligand_expr),
+                                                      avg_ligand_expr = mean(ligand_expr))
+
+ligand_oi_expr <- t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))
+#data.frame(val=df_from$ligand_expr) %>% ggplot(aes(x=val)) + geom_density()
+#data.frame(val=scale_quantile(df_from$ligand_expr)) %>% ggplot(aes(x=val)) + geom_density()
+```
+
+```{r}
+# Permutation test
+
+n_permutations <- 1000
+
+all_permutations <- lapply(possible_sender_celltypes, function(sender_ct) {
+  n <- knn_df %>% filter(from_cellType == "tumor_2", to_cellType == sender_ct) %>% pull(from_cellID) %>% unique %>% length
+  if (n > 0){
+    # Randomly sample cells from liver obj
+    permutations <- lapply(1:n_permutations, function(i) {
+      set.seed(i)
+      cells_with_sender_ct_as_neighbors <- knn_df %>% filter(to_cellType == sender_ct) %>% pull(from_cellID) %>% unique
+      sampled_cells <- sample(Cells(liver_seurat_obj) %>% .[. %in% cells_with_sender_ct_as_neighbors], n)
+      
+      random_cells_knn <- knn_df %>% filter(from_cellID %in% sampled_cells, to_cellType == sender_ct) %>%
+        rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from_cellID, neighbor_id = to_cellID)
+      
+      random_cells_ligand_expr_df <- random_cells_knn %>%
+        mutate(ligand_expr = ligand_oi_expr[.$neighbor_id,],
+                                    is_ligand_expr = ligand_expr > quantile(ligand_oi_expr, q_cutoff)) %>%
+        group_by(cell_id) %>% summarise(pct_ligand_expressed = sum(is_ligand_expr)/n(),
+                                        max_ligand_expr = max(ligand_expr),
+                                        avg_ligand_expr = mean(ligand_expr))
+      random_cells_ligand_expr_df %>% pull(max_ligand_expr)
+    }) %>% do.call(c, .) %>% data.frame() %>% mutate(sender_ct = sender_ct, type="permutation",
+                                                     repl = rep(1:n, each=n_permutations)) 
+    
+  }
+
+  
+}) %>% do.call(rbind, .)
+```
+
+```{r}
+permutations_df <- all_permutations %>% rename(value=".") %>%
+  bind_rows(ligand_expr_df %>% ungroup %>%  mutate(type="true", repl=1) %>% select(max_ligand_expr, type, neighbour_cellType) %>%
+              rename(value=max_ligand_expr, sender_ct = neighbour_cellType) %>% filter(!grepl("tumor", sender_ct)))
+
+permutations_summ_df <- all_permutations %>% rename(value=".") %>% group_by(sender_ct, repl) %>% summarise(mean_value = mean(value)) 
+ligand_expr_df_summ <- ligand_expr_df %>% filter(neighbour_cellType %in% unique(permutations_summ_df$sender_ct)) %>% group_by(neighbour_cellType) %>% summarise(mean_value = mean(max_ligand_expr)) %>% rename(sender_ct = neighbour_cellType)
+
+ggplot(permutations_summ_df, aes(x=mean_value)) +
+  geom_histogram() +
+  geom_vline(data = ligand_expr_df_summ, aes(xintercept = mean_value), color="red") +
+  facet_wrap(~sender_ct) +
+  theme_classic()
+ggsave("permutations_mean.png", width=3000, height=2500, units="px")
+
+# ggplot(permutations_df %>% mutate(group=factor(group, levels=unique(group))), aes(x=value, group=group, color = (group == 0))) +
+#   geom_density(alpha=0.1) + theme_classic()
+# 
+ggplot(permutations_df, aes(x=value, group=repl, color=type)) +
+  geom_line(aes(alpha=I(ifelse(permutations_df$type =="permutation", 0.1, 1))), stat="density") +
+  facet_wrap(~sender_ct) + theme_classic()
+ggsave("permutations_dist.png", width=3000, height=2500, units="px")
+
+sum(sapply(1:n_permutations, function(i) {
+  #c(mean(ligand_expr_df$max_ligand_expr)- mean(permutations[[i]]),
+  median(ligand_expr_df$max_ligand_expr)- median(permutations[[i]])
+})> 0)/n_permutations
+
+
+```
+
+```{r}
+hist(unlist(lapply(permutations, mean)))
+abline(v=mean(ligand_expr_df$max_ligand_expr), lwd=3, col="red")
+```
+
+```{r}
+
+ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=10) %>% pull(test_ligand) %>% .[2] # CXCL1
+
+# How many of the neighbors express this?
+q_cutoff <- 0.9
+ligand_expr_df <- df_from %>% mutate(ligand_expr = t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))[.$neighbor_id,],
+                              is_ligand_expr = ligand_expr > quantile(liver_seurat_obj[ligand_oi,]@assays$RNA@data, q_cutoff)) %>%
+  group_by(cell_id) %>% summarise(pct_ligand_expressed = sum(is_ligand_expr)/n(),
+                                  max_ligand_expr = max(ligand_expr),
+                                  avg_ligand_expr = mean(ligand_expr))
+
+
+# Permutation test?
+n_permutations <- 10000
+n <- length(unique(df_from$cell_id))
+ligand_oi_expr <- t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))
+# Randomly sample cells from liver obj
+permutations <- lapply(1:n_permutations, function(i) {
+  set.seed(i)
+  sampled_cells <- sample(Cells(liver_seurat_obj), n)
+  random_cells_knn <- knn_network %>% filter(from %in% sampled_cells) %>%
+    rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from, neighbor_id = to)
+  
+  random_cells_ligand_expr_df <- random_cells_knn %>%
+    mutate(ligand_expr = ligand_oi_expr[.$neighbor_id,],
+                                is_ligand_expr = ligand_expr > quantile(ligand_oi_expr, q_cutoff)) %>%
+    group_by(cell_id) %>% summarise(pct_ligand_expressed = sum(is_ligand_expr)/n(),
+                                    max_ligand_expr = max(ligand_expr),
+                                    avg_ligand_expr = mean(ligand_expr))
+  random_cells_ligand_expr_df %>% pull(max_ligand_expr)
+})
+
+permutations_df <- permutations %>% reshape2::melt() %>% rename(group=L1) %>% 
+  bind_rows(ligand_expr_df %>% mutate(group=0) %>% select(max_ligand_expr, group) %>% rename(value=max_ligand_expr))
+
+
+ggplot(permutations_df %>% mutate(group=factor(group, levels=unique(group))), aes(x=value, group=group, color = (group == 0))) +
+  geom_density(alpha=0.1) + theme_classic()
+
+sum(sapply(1:n_permutations, function(i) {
+  #c(mean(ligand_expr_df$max_ligand_expr)- mean(permutations[[i]]),
+  median(ligand_expr_df$max_ligand_expr)- median(permutations[[i]])
+})> 0)/n_permutations
+
+hist(unlist(lapply(permutations, mean)), xlim = c(0.2, 0.7))
+abline(v=mean(ligand_expr_df$max_ligand_expr), lwd=3, col="red")
+
+```
+
+
+```{r}
+
+ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=1) %>% pull(test_ligand) # CSF1
+target_oi <- vis_ligand_target[ligand_oi,] %>% .[which(. == max(.))] %>% names # NR1H3
+
+ggplot(liver_seurat_obj %>% AddMetaData(GetAssayData(liver_seurat_obj)[ligand_oi,], col.name="ligand") %>% .@meta.data) +
+  geom_jitter(aes(x=ligand, y=cellType), alpha=0.1) + theme_classic()
+
+ggplot(liver_seurat_obj %>% AddMetaData(GetAssayData(liver_seurat_obj)[target_oi,], col.name="target") %>% .@meta.data) +
+  geom_jitter(aes(x=target, y=cellType), alpha=0.1) + theme_classic()
+
+
+
+```
+
+
+```{r fig.height = 6, fig.width = 8}
+#  Coexpression plot Delaunay #
+ct_oi <- "Non.inflammatory.macrophages"
+
+delaunay_network <- liver_giotto_obj@spatial_network$Delaunay_network$networkDT %>%
+                  mutate(from_cellType = liver_seurat_obj@meta.data[.$from, "cellType"],
+                         to_cellType = liver_seurat_obj@meta.data[.$to, "cellType"])
+
+df_from <- delaunay_network %>% filter(from_cellType == ct_oi) %>%
+  rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from, neighbor_id = to)
+df_to <-  delaunay_network %>% filter(to_cellType == ct_oi) %>%
+  rename(cellType = to_cellType, neighbour_cellType = from_cellType, cell_id = to, neighbor_id = from)
+
+ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=1) %>% pull(test_ligand) # CSF1
+target_oi <- vis_ligand_target[ligand_oi,] %>% .[which(. == max(.))] %>% names # NR1H3
+
+coexpr_df <- bind_rows(df_from, df_to) %>% mutate("ligand_expr" = t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))[.$neighbor_id,],
+                                                  "target_expr" = t(data.frame(liver_seurat_obj[target_oi,]@assays$RNA@data))[.$cell_id,],
+                                                  "coexpression" = ligand_expr*target_expr)
+
+ggplot(coexpr_df, aes(x=distance, y=coexpression)) + 
+  geom_point() +
+  facet_wrap(~neighbour_cellType, scales = "free_x") + theme_classic()
+
+ggplot(coexpr_df, aes(x=ligand_expr, y=target_expr)) + 
+  geom_point() +
+  facet_wrap(~neighbour_cellType, scales = "free") + theme_classic()
+
+
+```
+
+```{r fig.height = 6, fig.width = 8}
+#  Coexpression plot KNN #
+k = 5
+
+for (k in c(5,10,50,100)){
+  liver_giotto_obj <- createSpatialKNNnetwork(gobject = liver_giotto_obj, k=k)
+
+  knn_network <- liver_giotto_obj@spatial_network$knn_network$networkDT %>%
+                    mutate(from_cellType = liver_seurat_obj@meta.data[.$from, "cellType"],
+                           to_cellType = liver_seurat_obj@meta.data[.$to, "cellType"])
+  
+  ct_oi <- "Non.inflammatory.macrophages"
+  
+  df_from <- knn_network %>% filter(from_cellType == ct_oi) %>%
+    rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from, neighbor_id = to)
+  # df_to <-  knn_network %>% filter(to_cellType == ct_oi) %>%
+  #   rename(cellType = to_cellType, neighbour_cellType = from_cellType, cell_id = to, neighbor_id = from)
+  # 
+  ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=1) %>% pull(test_ligand) # CSF1
+  target_oi <- vis_ligand_target[ligand_oi,] %>% .[which(. == max(.))] %>% names # NR1H3
+  
+  
+  coexpr_df <- df_from %>%
+    #bind_rows(df_from, df_to) %>%
+    mutate("ligand_expr" = t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))[.$neighbor_id,],
+                                                    "target_expr" = t(data.frame(liver_seurat_obj[target_oi,]@assays$RNA@data))[.$cell_id,],
+                                                    "coexpression" = ligand_expr*target_expr)
+  
+  
+  print(ggplot(coexpr_df, aes(x=distance, y=coexpression)) + 
+    geom_point() +
+    facet_wrap(~neighbour_cellType, scales = "free_x") + theme_classic())
+  
+  # ggplot(coexpr_df, aes(x=ligand_expr, y=target_expr)) + 
+  #   geom_point() +
+  #   facet_wrap(~neighbour_cellType, scales = "free") + theme_classic()
+    
+}
+
+```
+
+```{r}
+targets_oi <- vis_ligand_target[ligand_oi,] %>% data.frame("val"=.) %>% top_n(10) %>% arrange(desc(val)) %>% rownames
+
+k = 50
+
+
+liver_giotto_obj <- createSpatialKNNnetwork(gobject = liver_giotto_obj, k=k)
+
+knn_network <- liver_giotto_obj@spatial_network$knn_network$networkDT %>%
+                  mutate(from_cellType = liver_seurat_obj@meta.data[.$from, "cellType"],
+                         to_cellType = liver_seurat_obj@meta.data[.$to, "cellType"])
+
+ct_oi <- "Non.inflammatory.macrophages"
+
+df_from <- knn_network %>% filter(from_cellType == ct_oi) %>%
+  rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from, neighbor_id = to)
+df_to <-  knn_network %>% filter(to_cellType == ct_oi) %>%
+  rename(cellType = to_cellType, neighbour_cellType = from_cellType, cell_id = to, neighbor_id = from)
+
+
+ligand_oi <- summarized_ligand_activities %>% slice_max(order_by = aupr, n=1) %>% pull(test_ligand) # CSF1
+
+for (target_i in targets_oi){
+  coexpr_df <- bind_rows(df_from, df_to) %>% mutate("ligand_expr" = t(data.frame(liver_seurat_obj[ligand_oi,]@assays$RNA@data))[.$neighbor_id,],
+                                                  "target_expr" = t(data.frame(liver_seurat_obj[target_i,]@assays$RNA@data))[.$cell_id,],
+                                                  "coexpression" = ligand_expr*target_expr)
+  
+print(ggplot(coexpr_df, aes(x=distance, y=coexpression)) + 
+  geom_point() +
+  facet_wrap(~neighbour_cellType, scales = "free_x") + theme_classic() +
+    ggtitle(target_i))
+
+  
+}
+
+    
+
+```
+
+```{r}
+# Neighborhood composition at different k's
+count_df <- lapply(c(1, 5, 10, 20, 50, 100), function(k){
+  liver_giotto_obj <- createSpatialKNNnetwork(gobject = liver_giotto_obj, k=k)
+
+knn_network <- liver_giotto_obj@spatial_network$knn_network$networkDT %>%
+                  mutate(from_cellType = liver_seurat_obj@meta.data[.$from, "cellType"],
+                         to_cellType = liver_seurat_obj@meta.data[.$to, "cellType"])
+
+# df_from <- knn_network %>% filter(from_cellType == "Non.inflammatory.macrophages") %>%
+#   rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from, neighbor_id = to)
+
+df_from %>% group_by(cell_id, neighbour_cellType) %>% summarise(num_neighbours = n()) %>% mutate(k=k)
+df_to <-  knn_network %>% filter(to_cellType == "Non.inflammatory.macrophages") %>%
+  rename(cellType = to_cellType, neighbour_cellType = from_cellType, cell_id = to, neighbor_id = from)
+# 
+# bind_rows(df_from, df_to) %>% group_by(cell_id, neighbour_cellType) %>%  summarise(num_neighbours = n()) %>%
+#   mutate(k=k)
+
+}) %>% do.call(rbind, .)
+
+qual_col_pals = RColorBrewer::brewer.pal.info[RColorBrewer::brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(RColorBrewer::brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+ggplot(count_df %>% group_by(neighbour_cellType, k) %>% summarise(summed_n = sum(num_neighbours)),
+       aes(x=k, y=summed_n, color=neighbour_cellType, fill=neighbour_cellType)) + theme_classic() +
+  geom_area() +
+  scale_fill_manual(values=col_vector) +
+  scale_color_manual(values=col_vector)
+
+ggplot(count_df %>% group_by(neighbour_cellType, k) %>% summarise(summed_n = num_neighbours/sum(num_neighbours)),
+       aes(x=k, y=summed_n, color=neighbour_cellType, fill=neighbour_cellType)) + theme_classic() +
+  geom_area() +
+  scale_fill_manual(values=col_vector) +
+  scale_color_manual(values=col_vector)
+
+
+```
+
+```{r}
+cell_ID_vec <- colnames(liver_seurat_obj)
+
+count_df <- lapply(1:20, function(k){
+  
+  knn_matrix <- dbscan::kNN(liver_seurat_obj@meta.data %>% select(x_slide_mm, y_slide_mm) %>% as.matrix, k=k)
+  
+  knn_df <- data.frame(from = rep(1:nrow(knn_matrix$id), k),
+                            to = as.vector(knn_matrix$id),
+                            weight = 1/(1 + as.vector(knn_matrix$dist)),
+                            distance = as.vector(knn_matrix$dist)) %>%
+                mutate(from_cellID = cell_ID_vec[from], to_cellID = cell_ID_vec[to]) %>%
+                mutate(from_cellType = liver_seurat_obj@meta.data[.$from_cellID, "cellType"],
+                         to_cellType = liver_seurat_obj@meta.data[.$to_cellID, "cellType"])
+    
+
+  
+  knn_df %>% filter(from_cellType == "tumor_2") %>%
+    rename(cellType = from_cellType, neighbour_cellType = to_cellType, cell_id = from_cellID, neighbor_id = to_cellID) %>%
+    group_by(cell_id, neighbour_cellType) %>%  summarise(num_neighbours = n()) %>% mutate(k=k)
+
+
+}) %>% do.call(rbind, .)
+
+count_df_summ <- count_df %>% group_by(k, neighbour_cellType) %>% summarise(summed_n = sum(num_neighbours)) %>% group_by(k) %>% mutate(props = summed_n/sum(summed_n))
+
+qual_col_pals = RColorBrewer::brewer.pal.info[RColorBrewer::brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(RColorBrewer::brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+ggplot(count_df_summ,
+       aes(x=k, y=props, color=neighbour_cellType, fill=neighbour_cellType)) + theme_classic() +
+  geom_area() +
+  scale_fill_manual(values=col_vector) +
+  scale_color_manual(values=col_vector)
+ggsave("tumor_2_neighborhood.png", width=3000, height=2000, units = "px")
+
+```
