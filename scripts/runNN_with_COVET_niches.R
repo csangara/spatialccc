@@ -130,7 +130,7 @@ nn_idx_df <- nns$nn.idx %>% data.frame() %>% pivot_longer(X2:X9) %>%
   select(-name) %>% rename(cell_id = X1, neighbor_id = value) %>% 
   filter(neighbor_id != 0) 
 
-cell_ids_list <- nn_idx_df$cell_id %>% unique %>% .[1:10000] # Subset
+cell_ids_list <- nn_idx_df$cell_id %>% unique 
 
 # Subset objects for faster lookup
 seuratObj_subset <- seuratObj[rownames(seuratObj) %in% rownames(ligand_target_matrix),]@assays$RNA@data
@@ -172,24 +172,29 @@ prcs_list <- pbmcapply::pbmclapply(cell_ids_list, function(id) {
   # Create score matrix based on real expression
   scores <- rep(list(c(obs_expr)), length(labels))
   
-  # Calculate AUPR for each ligand
-  prcs <- precrec::evalmod(scores=scores, labels=labels,
-                           dsids = 1:length(expressed_ligands), mode="prcroc")
-  prcs_cell <- attr(prcs, "aucs") %>% filter(curvetypes == "PRC")
-  prcs_cell$aucs %>% setNames(expressed_ligands)
+  if (length(scores) == 0){
+    return(NA)
+  } else{
+    # Calculate AUPR for each ligand
+    prcs <- precrec::evalmod(scores=scores, labels=labels,
+                             dsids = 1:length(expressed_ligands), mode="prcroc")
+    prcs_cell <- attr(prcs, "aucs") %>% filter(curvetypes == "PRC")
+    return(prcs_cell$aucs %>% setNames(expressed_ligands))
+  }
   
 }, mc.cores = 12)
 
-# There was some error in prcs_list -> do this for now
-prcs_list_c <- prcs_list[which(sapply(prcs_list, is.double))] %>%
-  setNames(which(sapply(prcs_list, is.double)))
+prcs_list <- readRDS("data/prcs_list.rds")
+
+prcs_list <- setNames(prcs_list, cell_ids_list)
+
 
 # Plot distribution of max AUPR
-sapply(prcs_list_c, max) %>% data.frame(val=.) %>% ggplot(aes(x=val)) + geom_density() + theme_classic()
+sapply(prcs_list, max) %>% data.frame(val=.) %>% ggplot(aes(x=val)) + geom_density() + theme_classic()
 
 # Add AUPR to metadata, plot distribution spatially
 metadata$aupr <- NA
-metadata[as.numeric(names(prcs_list_c)), "aupr"] <- sapply(prcs_list_c, max)
+metadata[as.numeric(names(prcs_list)), "aupr"] <- sapply(prcs_list, mean)
 ggplot(metadata %>% arrange(!is.na(aupr)),
        aes(x=SPATIAL_1, y=SPATIAL_2, color=aupr)) +
   geom_point() + 
@@ -201,15 +206,18 @@ loi <- "Angpt2"
 FeaturePlot(seuratObj, loi, reduction="spatial", order=TRUE)
 
 # Calculate Moran's I
-dists_matrix <- as.matrix(dist(metadata[as.numeric(names(prcs_list_c)), c("SPATIAL_1", "SPATIAL_2")]))
+dists_matrix <- as.matrix(dist(metadata[as.numeric(names(prcs_list)), c("SPATIAL_1", "SPATIAL_2")]))
 dists_matrix <- 1/dists_matrix
 diag(dists_matrix) <- 0
-moran <- ape::Moran.I(sapply(prcs_list_c, max), dists_matrix)
+moran <- ape::Moran.I(sapply(prcs_list, max), dists_matrix)
 moran
+
+metadata_sub <- metadata %>% filter(!is.na(aupr))
+moran <- moranfast::moranfast(metadata_sub$aupr, metadata_sub$SPATIAL_1, metadata_sub$SPATIAL_2)
 
 # Investigating results
 # Melt into dataframe, keep names of ligands
-prcs_df <- prcs_list_c %>% unlist %>% data.frame(aupr=.) %>% 
+prcs_df <- prcs_list %>% unlist %>% data.frame(aupr=.) %>% 
   rownames_to_column("cell_ligand") %>% 
   separate(cell_ligand, c("cell_id", "ligand"), sep="\\.")
 
